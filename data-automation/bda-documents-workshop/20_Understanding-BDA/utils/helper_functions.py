@@ -3,7 +3,9 @@ import time
 import boto3
 from urllib.parse import urlparse
 import requests
+import base64
 import io
+from PIL import Image
 from PyPDF2 import PdfReader, PdfWriter
 from botocore.exceptions import ClientError
 from IPython.display import HTML
@@ -11,10 +13,117 @@ from IPython.display import display
 from botocore.auth import SigV4Auth
 from botocore.awsrequest import AWSRequest
 import json
+import ipywidgets as widgets
 
-
+s3_client = boto3.client("s3")
 bda_client = boto3.client('bedrock-data-automation')
 bda_runtime_client = boto3.client('bedrock-data-automation-runtime')
+
+
+def pil_to_bytes(image):
+    byte_arr = io.BytesIO()
+    image.save(byte_arr, format='PNG')
+    return byte_arr.getvalue()
+
+
+def display_image(image):
+    image_widget = widgets.Image(value=pil_to_bytes(image), format='png')
+    image_widget.layout.width = '400px'
+    image_widget.layout.height = 'auto'
+    image_widget.layout.object_fit = 'contain'
+    return image_widget
+
+def json_to_html(json_obj, indent=0):
+    result = []
+    if isinstance(json_obj, dict):
+        result.append('<table class="json-object">')
+        for key, value in json_obj.items():
+            result.append('<tr>')
+            result.append(f'<td class="key">{key}</td>')
+            result.append('<td class="value">')
+            result.append(json_to_html(value, indent + 1))
+            result.append('</td>')
+            result.append('</tr>')
+        result.append('</table>')
+    elif isinstance(json_obj, list):
+        result.append('<table class="json-array">')
+        for i, item in enumerate(json_obj):
+            result.append('<tr>')
+            result.append(f'<td class="key">{i}</td>')
+            result.append('<td class="value">')
+            result.append(json_to_html(item, indent + 1))
+            result.append('</td>')
+            result.append('</tr>')
+        result.append('</table>')
+    elif isinstance(json_obj, (str, int, float, bool)) or json_obj is None:
+        if isinstance(json_obj, str):
+            result.append(f'<span class="string">"{json_obj}"</span>')
+        elif isinstance(json_obj, bool):
+            result.append(f'<span class="boolean">{str(json_obj).lower()}</span>')
+        elif json_obj is None:
+            result.append('<span class="null">null</span>')
+        else:
+            result.append(f'<span class="number">{json_obj}</span>')
+    return ''.join(result)
+    
+def display_json(json_data, title):
+    html_content = f"""
+    <div class="json-container">
+        <h3 class="json-title">{title}</h3>
+        <div class="json-viewer">
+            {json_to_html(json_data)}
+        </div>
+    </div>
+    <style>
+        .json-container {{
+            margin-bottom: 20px;
+        }}
+        .json-title {{
+            font-family: sans-serif;
+            font-size: 18px;
+            font-weight: bold;
+            margin-bottom: 10px;
+            color: #333;
+        }}
+        .json-viewer {{
+            font-family: monospace;
+            font-size: 14px;
+            line-height: 1.5;
+            background-color: #f8f8f8;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            padding: 10px;
+            max-height: 500px;
+            overflow: auto;
+        }}
+        .json-object, .json-array {{
+            border-collapse: collapse;
+            margin-left: 20px;
+        }}
+        .key {{
+            color: #881391;
+            vertical-align: top;
+            padding-right: 10px;
+        }}
+        .value {{
+            padding-left: 10px;
+        }}
+        .string {{ color: #1a1aa6; }}
+        .number {{ color: #116644; }}
+        .boolean {{ color: #ff8c00; }}
+        .null {{ color: #808080; }}
+    </style>
+    """
+    return widgets.HTML(html_content)
+
+def display_image_jsons(image, json_arr, titles):
+    image_widget = display_image(image)
+    right_column =  widgets.VBox([display_json(data, title) for data, title in zip(json_arr, titles)])
+    bordered_hbox = widgets.HBox([image_widget, right_column])
+    bordered_hbox.layout.border = '5px solid black'
+    bordered_hbox.layout.padding = '10px'
+    bordered_hbox.layout.margin = '10px'
+    return bordered_hbox
 
 def get_bucket_and_key(s3_uri):
     parsed_uri = urlparse(s3_uri)
@@ -92,7 +201,7 @@ def download_document(url, start_page_index=None, end_page_index=None, output_fi
         page = pdf_reader.pages[page_num]
         pdf_writer.add_page(page)
 
-    print(output_file_path)
+    print(f"Created file: {output_file_path}")
     # Save the extracted pages to a new PDF
     with open(output_file_path, "wb") as output_file:
         pdf_writer.write(output_file)
@@ -105,40 +214,9 @@ from urllib.parse import urlparse
 from typing import Optional
 import pandas as pd
 
-def generate_presigned_url(s3_uri: str, expiration: int = 3600) -> Optional[str]:
-    """
-    Generate a presigned URL for an S3 object with retry logic.
-    
-    Args:
-        s3_uri (str): S3 URI in format 's3://bucket-name/key'
-        expiration (int): URL expiration time in seconds
-        
-    Returns:
-        Optional[str]: Presigned URL or None if generation fails
-    """
-    try:
-        parsed = urlparse(s3_uri)
-        bucket = parsed.netloc
-        key = parsed.path.lstrip('/')
-        
-        config = Config(
-            signature_version='s3v4',
-            retries={'max_attempts': 3}
-        )
-        s3_client = boto3.client('s3', config=config)
-        
-        return s3_client.generate_presigned_url(
-            'get_object',
-            Params={'Bucket': bucket, 'Key': key},
-            ExpiresIn=expiration
-        )
-    except Exception as e:
-        print(f"Error generating presigned URL for {s3_uri}: {e}")
-        return None
-
 def create_image_html_column(row: pd.Series, image_col: str, width: str = '300px') -> str:
     """
-    Create HTML embedded image from S3 URI using presigned URL for a DataFrame row.
+    Create HTML embedded image from S3 URI by downloading and base64 encoding the image for a DataFrame row.
     
     Args:
         row (pd.Series): DataFrame row
@@ -149,16 +227,42 @@ def create_image_html_column(row: pd.Series, image_col: str, width: str = '300px
         str: HTML string for embedded image
     """
     s3_uri = row[image_col]
-    if type(s3_uri)==list:
-        s3_uri=s3_uri[0]    
+    if isinstance(s3_uri, list):
+        s3_uri = s3_uri[0]    
     if pd.isna(s3_uri):
         return ''
     
-    presigned_url = generate_presigned_url(s3_uri)
-    if presigned_url:
-        return f'<img src="{presigned_url}" style="width: {width}; object-fit: contain;">'
-    return ''
+    try:
+        # Parse S3 URI
+        bucket_name, object_key = get_bucket_and_key(s3_uri)
 
+        
+        # Initialize S3 client
+        s3_client = boto3.client('s3')
+        
+        # Download image from S3
+        response = s3_client.get_object(Bucket=bucket_name, Key=object_key)
+        image_content = response['Body'].read()
+        
+        # Open image using PIL
+        image = Image.open(io.BytesIO(image_content))
+        
+        # Convert image to RGB if it's in RGBA mode
+        if image.mode == 'RGBA':
+            image = image.convert('RGB')
+        
+        # Save image to bytes
+        buffered = io.BytesIO()
+        image.save(buffered, format="JPEG")
+        
+        # Encode image to base64
+        img_str = base64.b64encode(buffered.getvalue()).decode()
+        
+        # Create HTML string with base64 encoded image
+        return f'<img src="data:image/jpeg;base64,{img_str}" style="width: {width}; object-fit: contain;">'
+    except Exception as e:
+        print(f"Error processing image {s3_uri}: {str(e)}")
+        return ''
 
 # Example usage:
 """
@@ -259,8 +363,9 @@ def send_request(region, url, method, credentials, payload=None, service='bedroc
     data = json.loads(content)
     return data
 
-def invoke_blueprint_recommendation_async(bda_client,region_name, payload):
+def invoke_blueprint_recommendation_async(bda_client, payload):
     credentials = boto3.Session().get_credentials().get_frozen_credentials()
+    region_name = boto3.Session().region_name
     url = f"{bda_client.meta.endpoint_url}/invokeBlueprintRecommendationAsync"
     print(f'Sending request to {url}')
     result = send_request(
@@ -273,7 +378,9 @@ def invoke_blueprint_recommendation_async(bda_client,region_name, payload):
     return result
 
 
-def get_blueprint_recommendation(bda_client, region_name, credentials, job_id):
+def get_blueprint_recommendation(bda_client, job_id):
+    credentials = boto3.Session().get_credentials().get_frozen_credentials()
+    region_name = boto3.Session().region_name
     url = f"{bda_client.meta.endpoint_url}/getBlueprintRecommendation/{job_id}/"
     result = send_request(
         region = region_name,
@@ -282,6 +389,18 @@ def get_blueprint_recommendation(bda_client, region_name, credentials, job_id):
         credentials = credentials        
     )
     return result
+
+def get_s3_to_dict(s3_url):
+    bucket_name = s3_url.split('/')[2]
+    object_key = '/'.join(s3_url.split('/')[3:])
+    
+    # Download the JSON file from S3
+    response = s3_client.get_object(Bucket=bucket_name, Key=object_key)
+    json_content = response['Body'].read().decode('utf-8')
+    
+    # Parse the JSON content
+    json_obj = json.loads(json_content)
+    return json_obj
 
 def create_or_update_blueprint(bda_client, blueprint_name, blueprint_description, blueprint_type, blueprint_stage, blueprint_schema):
     list_blueprints_response = bda_client.list_blueprints(
@@ -316,28 +435,16 @@ def transform_custom_output(input_json, explainability_info):
         "forms": {},
         "tables": {}
     }
+
+    def add_confidence(value, conf_info):
+        return {"value": value, "confidence": conf_info["confidence"]} if isinstance(conf_info, dict) and "confidence" in conf_info else value
     
-    def add_confidence(value, confidence_info):
-        # For simple key-value pairs
-        if isinstance(confidence_info, dict) and 'confidence' in confidence_info:
-            return {
-                "value": value,
-                "confidence": confidence_info['confidence']
-            }
-        return value
-    
-    def process_list_item(item, confidence_info):
-        # For handling nested dictionaries within lists
-        processed_item = {}
-        for key, value in item.items():
-            if isinstance(confidence_info, dict) and key in confidence_info:
-                processed_item[key] = add_confidence(value, confidence_info[key])
-        return processed_item
+    def process_list_item(item, conf_info):
+        return {k: add_confidence(v, conf_info.get(k, {})) for k, v in item.items() if isinstance(conf_info, dict)}    
 
     # Iterate through the input JSON
     for key, value in input_json.items():
         confidence_data = explainability_info.get(key, {})
-        
         if isinstance(value, list):
             # Handle lists (tables)
             processed_list = []
@@ -353,19 +460,11 @@ def transform_custom_output(input_json, explainability_info):
             
     return result
 
+
 def get_summaries(custom_outputs):
-    custom_output_summaries = []
-    for custom_output in custom_outputs:
-        custom_output_summary = {}
-        if custom_output:
-            custom_output_summary = {
-                'page_indices': custom_output.get('split_document', {}).get('page_indices', None),
-                'matched_blueprint_name': custom_output.get('matched_blueprint', {}).get('name', None),
-                'confidence': custom_output.get('matched_blueprint', {}).get('confidence', None),
-                'document_class_type': custom_output.get('document_class', {}).get('type', None),
-                #'matched_blueprint_arn': custom_output.get('matched_blueprint', {}).get('arn', None)
-            }
-        else:
-            custom_output_summary = {}
-        custom_output_summaries += [custom_output_summary]
-    return custom_output_summaries
+    return [{
+        'page_indices': output.get('split_document', {}).get('page_indices'),
+        'matched_blueprint_name': output.get('matched_blueprint', {}).get('name'),
+        'confidence': output.get('matched_blueprint', {}).get('confidence'),
+        'document_class_type': output.get('document_class', {}).get('type')
+    } if output else {} for output in custom_outputs]

@@ -77,7 +77,7 @@ def create_knowledge_base(bedrock_agent, kb_name,
                 description=kb_description,
                 knowledgeBaseConfiguration=knowledge_base_configuration,
                 name=kb_name,
-                roleArn=role_arn,
+                roleArn=kb_role_arn,
                 storageConfiguration=storage_configuration
             )
         return create_kb_response['knowledgeBase']['knowledgeBaseId']
